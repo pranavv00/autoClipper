@@ -139,10 +139,22 @@ log_success "Video processing complete. Clips ready in output/ folder."
 log_step "[5/5] Running Instagram Reels Scheduler (schedule_upload.py)..."
 
 # Ensure any previous automation Chrome is terminated cleanly to release profile lock
-pkill -f "Chrome-Automation" 2>/dev/null || true
+# Run scheduler with automatic retry if any reels fail to schedule
+MAX_RUNS=5
+RUN_COUNT=1
+while [ $RUN_COUNT -le $MAX_RUNS ]; do
+    log_info "Launching Reels Scheduler (Pass $RUN_COUNT of $MAX_RUNS)..."
+    pkill -f "Chrome-Automation" 2>/dev/null || true
+    if python schedule_upload.py "$@"; then
+        log_success "All pending reels processed successfully on pass $RUN_COUNT."
+        break
+    else
+        STATUS=$?
+        log_warn "Scheduler exited with code $STATUS. Re-running in 10 seconds to schedule remaining clips..."
+        pkill -f "Chrome-Automation" 2>/dev/null || true
+        sleep 10
+        RUN_COUNT=$((RUN_COUNT + 1))
+    fi
+done
 
-# Run scheduler with arguments passed into this script (defaults to full schedule)
-# Automatically uses last scheduled reel from upload_log.json (+3 hours)
-python schedule_upload.py "$@"
-
-echo -e "\n${BOLD}${GREEN}🎉 Workflow finished successfully!${NC}\n"
+echo -e "\n${BOLD}${GREEN}🎉 Workflow finished!${NC}\n"

@@ -934,9 +934,20 @@ def main() -> None:
         for i, clip in enumerate(pending, start=1):
             _log_separator()
             sched_str = clip["scheduled_time"].strftime("%I:%M %p")
-            _log(f"[{i}/{len(pending)}] {clip['caption']}  →  scheduled for {sched_str}")
+            _log(f"[{i}/{len(pending)}] Part {clip['part']} ({clip['clip_name']})  →  scheduled for {sched_str}")
 
             result = upload_and_schedule_reel(driver, clip)
+
+            # Auto-retry if upload did not succeed on first attempt
+            if not result:
+                _log("⚠ First attempt did not succeed. Refreshing page and retrying in 6s...", indent=1)
+                time.sleep(6)
+                try:
+                    driver.get("https://www.instagram.com/")
+                    time.sleep(4)
+                except Exception:
+                    pass
+                result = upload_and_schedule_reel(driver, clip)
 
             if result:
                 success += 1
@@ -949,7 +960,7 @@ def main() -> None:
                 _log(f"✅ ({success}/{len(pending)}) scheduled")
             else:
                 fail += 1
-                _log(f"❌ Failed — continuing to next clip...")
+                _log(f"❌ Failed after retry — continuing to next clip...")
 
             # Brief pause between uploads
             if i < len(pending):
@@ -969,7 +980,8 @@ def main() -> None:
         _log("\n🎉 Instagram will publish them automatically at the scheduled times!")
 
         if fail > 0:
-            _log("💡 Re-run the script to retry failed uploads.\n")
+            _log("💡 Some clips failed. Workflow runner will re-run automatically to retry.\n")
+            sys.exit(1)
 
     except KeyboardInterrupt:
         print()
