@@ -9,6 +9,7 @@ Supports videos of any length without temporary files or disk limits.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import shutil
@@ -197,6 +198,66 @@ def is_valid_clip(clip_path: Path) -> bool:
         return False
 
 
+def encode_single_clip(
+    video_path: Path,
+    output_folder: Path,
+    part_num: int,
+    expected_clips: int,
+    clip_duration: int,
+) -> bool:
+    """Encode a single vertical clip with strict Instagram web compatibility."""
+    clip_name = f"clip_{part_num:03d}.mp4"
+    clip_path = output_folder / clip_name
+    start_sec = (part_num - 1) * clip_duration
+
+    # Resume support: skip if clip already exists and has valid SAR 1:1 + High profile
+    if is_valid_clip(clip_path):
+        print(f"\r  [{part_num}/{expected_clips}] {clip_name} (already verified 1:1) ✓", end="", flush=True)
+        return True
+
+    filtergraph = build_filtergraph(part_num)
+
+    cmd: list[str] = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", str(start_sec),
+        "-i", str(video_path),
+        "-t", str(clip_duration),
+        "-vf", filtergraph,
+        "-af", "asetpts=PTS-STARTPTS",
+        "-c:v", "libx264",
+        "-preset", ENCODING_PRESET,
+        "-profile:v", "high",
+        "-level", "4.1",
+        "-crf", str(CRF_QUALITY),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-avoid_negative_ts", "make_zero",
+        "-y",
+        str(clip_path),
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if res.returncode == 0 and clip_path.exists() and clip_path.stat().st_size > 50000:
+            print(f"\r  [{part_num}/{expected_clips}] {clip_name} ✓", end="", flush=True)
+            return True
+        else:
+            print()
+            _log(f"⚠ Failed to create {clip_name}", indent=1)
+            if res.stderr.strip():
+                _log(f"  FFmpeg: {res.stderr.strip()[:200]}", indent=2)
+            return False
+    except Exception as exc:
+        print()
+        _log(f"⚠ Error creating {clip_name}: {exc}", indent=1)
+        return False
+
+
 def process_video(
     video_path: Path,
     output_folder: Path,
@@ -204,7 +265,7 @@ def process_video(
 ) -> int:
     """
     Split video_path into 9:16 vertical clips of clip_duration seconds.
-    Direct single-pass encoding: scalable to any length with fast seek and resume.
+    Uses multi-threaded parallel single-pass FFmpeg encoding for ultra-fast throughput.
     """
     video_info = get_video_info(video_path)
     if video_info is None or video_info["duration"] <= 0:
@@ -219,60 +280,28 @@ def process_video(
     _log(f"Output   : {output_folder}", indent=1)
 
     output_folder.mkdir(parents=True, exist_ok=True)
-    clips_done = 0
     start_time = time.monotonic()
 
-    for i in range(expected_clips):
-        part_num = i + 1
-        clip_name = f"clip_{part_num:03d}.mp4"
-        clip_path = output_folder / clip_name
-        start_sec = i * clip_duration
+    # Process clips in parallel using 4 worker threads
+    max_workers = min(4, expected_clips)
+    _log(f"Encoding : Running with {max_workers} parallel workers...", indent=1)
 
-        # Resume support: skip if clip already exists and has valid SAR 1:1
-        if is_valid_clip(clip_path):
-            clips_done += 1
-            print(f"\r  [{part_num}/{expected_clips}] {clip_name} (already verified 1:1) ✓", end="", flush=True)
-            continue
-
-        filtergraph = build_filtergraph(part_num)
-
-        cmd: list[str] = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-ss", str(start_sec),
-            "-i", str(video_path),
-            "-t", str(clip_duration),
-            "-vf", filtergraph,
-            "-af", "asetpts=PTS-STARTPTS",
-            "-c:v", "libx264",
-            "-preset", ENCODING_PRESET,
-            "-profile:v", "high",
-            "-level", "4.1",
-            "-crf", str(CRF_QUALITY),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ar", "44100",
-            "-avoid_negative_ts", "make_zero",
-            "-y",
-            str(clip_path),
-        ]
-
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if res.returncode == 0 and clip_path.exists() and clip_path.stat().st_size > 50000:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                encode_single_clip,
+                video_path,
+                output_folder,
+                i + 1,
+                expected_clips,
+                clip_duration
+            ): i + 1
+            for i in range(expected_clips)
+        }
+        clips_done = 0
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
                 clips_done += 1
-                print(f"\r  [{part_num}/{expected_clips}] {clip_name} ✓", end="", flush=True)
-            else:
-                print()
-                _log(f"⚠ Failed to create {clip_name}", indent=1)
-                if res.stderr.strip():
-                    _log(f"  FFmpeg: {res.stderr.strip()[:200]}", indent=2)
-        except Exception as exc:
-            print()
-            _log(f"⚠ Error creating {clip_name}: {exc}", indent=1)
 
     print()
     elapsed = time.monotonic() - start_time
