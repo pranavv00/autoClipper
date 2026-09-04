@@ -41,7 +41,8 @@ VERTICAL_HEIGHT: int = 1920
 CRF_QUALITY: int = 18
 
 # Encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, slow)
-ENCODING_PRESET: str = "ultrafast"
+# Note: veryfast guarantees H.264 High Profile with B-frames for full Instagram web compatibility
+ENCODING_PRESET: str = "veryfast"
 
 # Add text overlay to clips (e.g. "Part 1", "Part 2")
 ADD_PART_TEXT: bool = True
@@ -144,9 +145,11 @@ def build_filtergraph(
     out_width: int = VERTICAL_WIDTH,
     out_height: int = VERTICAL_HEIGHT,
 ) -> str:
-    """Build single-pass vertical scaling, padding, and text overlay filter."""
+    """Build single-pass vertical scaling, padding, and text overlay filter with strict SAR 1:1."""
     filters = [
-        f"scale={out_width}:{out_height}:force_original_aspect_ratio=decrease",
+        "setpts=PTS-STARTPTS",
+        f"scale={out_width}:-2",
+        "setsar=1",
         f"pad={out_width}:{out_height}:(ow-iw)/2:(oh-ih)/2:black",
         "format=yuv420p",
     ]
@@ -162,6 +165,36 @@ def build_filtergraph(
         filters.append(text_filter)
 
     return ",".join(filters)
+
+
+def is_valid_clip(clip_path: Path) -> bool:
+    """Check if clip exists, is healthy, has standard SAR 1:1, and High/Main profile."""
+    if not clip_path.exists() or clip_path.stat().st_size < 50000:
+        return False
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=sample_aspect_ratio,profile",
+            "-of", "default=noprint_wrappers=1",
+            str(clip_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if res.returncode != 0:
+            return False
+        
+        sar_ok = False
+        profile_ok = False
+        for line in res.stdout.strip().splitlines():
+            if line.startswith("sample_aspect_ratio="):
+                sar = line.split("=", 1)[1].strip()
+                sar_ok = sar in ("1:1", "")
+            elif line.startswith("profile="):
+                prof = line.split("=", 1)[1].strip().lower()
+                profile_ok = ("high" in prof or "main" in prof)
+        return sar_ok and profile_ok
+    except Exception:
+        return False
 
 
 def process_video(
@@ -195,10 +228,10 @@ def process_video(
         clip_path = output_folder / clip_name
         start_sec = i * clip_duration
 
-        # Resume support: skip if clip already exists and is healthy (>50KB)
-        if clip_path.exists() and clip_path.stat().st_size > 50000:
+        # Resume support: skip if clip already exists and has valid SAR 1:1
+        if is_valid_clip(clip_path):
             clips_done += 1
-            print(f"\r  [{part_num}/{expected_clips}] {clip_name} (already exists) ✓", end="", flush=True)
+            print(f"\r  [{part_num}/{expected_clips}] {clip_name} (already verified 1:1) ✓", end="", flush=True)
             continue
 
         filtergraph = build_filtergraph(part_num)
@@ -211,14 +244,18 @@ def process_video(
             "-i", str(video_path),
             "-t", str(clip_duration),
             "-vf", filtergraph,
+            "-af", "asetpts=PTS-STARTPTS",
             "-c:v", "libx264",
             "-preset", ENCODING_PRESET,
+            "-profile:v", "high",
+            "-level", "4.1",
             "-crf", str(CRF_QUALITY),
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
             "-b:a", "192k",
-            "-avoid_negative_ts", "1",
+            "-ar", "44100",
+            "-avoid_negative_ts", "make_zero",
             "-y",
             str(clip_path),
         ]

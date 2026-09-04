@@ -441,6 +441,19 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
         _log("⏳ Waiting for video to process...", indent=1)
         human_delay(5.0, 2.0)
 
+        # Check for browser video decoding/reading error modal
+        try:
+            error_modal = driver.find_element(By.XPATH,
+                "//*[contains(text(), \"Video couldn't be uploaded\") or "
+                "contains(text(), 'could not be read by your browser')]"
+            )
+            if error_modal.is_displayed():
+                _log("✖  Instagram error modal: Video could not be read by browser", indent=1)
+                driver.save_screenshot("/tmp/ig_debug_read_error.png")
+                return False
+        except NoSuchElementException:
+            pass
+
         # Dismiss any ratio / reel alert popup
         try:
             ok_btn = driver.find_element(By.XPATH,
