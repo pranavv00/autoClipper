@@ -61,6 +61,14 @@ OUTPUT_DIR: str = "output"
 # Supported video file extensions
 SUPPORTED_EXTENSIONS: set[str] = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
+# Add text overlay to clips (e.g. "Part 1", "Part 2")
+ADD_PART_TEXT: bool = True
+TEXT_FONT: str = "/System/Library/Fonts/Avenir Next.ttc"
+TEXT_COLOR: str = "white"
+TEXT_SIZE: int = 72
+CRF_QUALITY: int = 18
+ENCODING_PRESET: str = "ultrafast"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,13 +218,6 @@ def split_video(
         clip_path: Path = output_folder / clip_name
 
         # Build the FFmpeg command:
-        #   -ss <start>          : seek to start position
-        #   -i <input>           : input file
-        #   -t <duration>        : clip length
-        #   -c copy              : stream-copy (no re-encode) — fastest
-        #   -avoid_negative_ts 1 : fix timestamp issues when stream-copying
-        #   -map 0               : copy ALL streams (video, audio, subtitles)
-        #   -y                   : overwrite without asking
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
@@ -224,12 +225,36 @@ def split_video(
             "-ss", str(start_sec),
             "-i", str(video_path),
             "-t", str(clip_duration),
-            "-c", "copy",
+        ]
+
+        if ADD_PART_TEXT:
+            part_text = f"Part {i + 1}"
+            vf_filter = (
+                f"drawtext=fontfile='{TEXT_FONT}':text='{part_text}':"
+                f"fontcolor={TEXT_COLOR}:fontsize={TEXT_SIZE}:"
+                f"x=(w-text_w)/2:y=520:"
+                f"shadowcolor=black:shadowx=4:shadowy=4"
+            )
+            cmd.extend([
+                "-vf", vf_filter,
+                "-c:v", "libx264",
+                "-preset", ENCODING_PRESET,
+                "-crf", str(CRF_QUALITY),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-c:a", "copy",
+            ])
+        else:
+            cmd.extend([
+                "-c", "copy",
+                "-map", "0",
+            ])
+
+        cmd.extend([
             "-avoid_negative_ts", "1",
-            "-map", "0",
             "-y",
             str(clip_path),
-        ]
+        ])
 
         try:
             result = subprocess.run(
