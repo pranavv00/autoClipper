@@ -349,6 +349,35 @@ def ensure_instagram_logged_in(driver) -> bool:
     return False
 
 
+def _warmup_video_decoder(driver, video_path: str) -> None:
+    """
+    Force Chrome to initialise its GPU video decoder (Apple VideoToolbox on macOS)
+    by loading a video file directly. On cold launch the decoder isn't ready and
+    Instagram's JS-based video preview fails with 'could not be read by your browser'.
+    Loading any video via file:// URL primes the decoder for all subsequent uses.
+    """
+    _log("🔥 Warming up Chrome video decoder...")
+    try:
+        driver.get(f"file://{video_path}")
+        time.sleep(3)
+        # Verify the video actually decoded
+        result = driver.execute_script("""
+            let v = document.querySelector('video');
+            if (!v) return {ok: false, reason: 'no video element'};
+            return {ok: v.readyState >= 2, width: v.videoWidth, height: v.videoHeight};
+        """)
+        if result and result.get("ok"):
+            _log(f"✓ Video decoder ready ({result.get('width')}x{result.get('height')})")
+        else:
+            _log(f"⚠ Decoder warmup inconclusive: {result}")
+        # Navigate away so we start clean
+        driver.get("about:blank")
+        time.sleep(0.5)
+    except Exception as exc:
+        _log(f"⚠ Decoder warmup error (non-fatal): {exc}")
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INSTAGRAM UPLOAD + SCHEDULE FLOW
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,40 +470,14 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
         _log("⏳ Waiting for video to process...", indent=1)
         human_delay(5.0, 2.0)
 
-        # Check for browser video decoding/reading error modal with automatic retry
-        for attempt in range(2):
-            try:
-                error_modal = driver.find_element(By.XPATH,
-                    "//*[contains(text(), \"Video couldn't be uploaded\") or "
-                    "contains(text(), 'could not be read by your browser')]"
-                )
-                if error_modal.is_displayed():
-                    _log("⚠ Instagram error: 'Video could not be read by browser' — attempting in-place retry...", indent=1)
-                    try:
-                        select_btn = driver.find_element(By.XPATH, "//button[contains(., 'Select other files') or text()='Select other files']")
-                        select_btn.click()
-                    except Exception:
-                        pass
-                    human_delay(2.0)
-                    file_input = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
-                    )
-                    file_input.send_keys(video_path)
-                    _log("✓ Video file re-sent, waiting for decoding...", indent=1)
-                    human_delay(6.0, 2.0)
-                else:
-                    break
-            except NoSuchElementException:
-                break
-
-        # Final check if error modal is still stubbornly present
+        # Check for browser video decoding/reading error modal
         try:
             error_modal = driver.find_element(By.XPATH,
                 "//*[contains(text(), \"Video couldn't be uploaded\") or "
                 "contains(text(), 'could not be read by your browser')]"
             )
             if error_modal.is_displayed():
-                _log("✖  Instagram error modal persisted after retry", indent=1)
+                _log("✖  Instagram error: Video could not be read by browser", indent=1)
                 driver.save_screenshot("/tmp/ig_debug_read_error.png")
                 return False
         except NoSuchElementException:
@@ -953,6 +956,13 @@ def main() -> None:
         if not ensure_instagram_logged_in(driver):
             _log("✖ Cannot proceed without being logged in to Instagram.")
             return
+
+        # Warm up Chrome's video decoder before uploads
+        # On cold launch, the GPU/VideoToolbox decoder isn't ready and Instagram's
+        # frontend video preview times out with "could not be read by your browser".
+        # Loading a video as file:// URL forces Chrome to initialise the decoder.
+        first_clip = pending[0]["path"].resolve()
+        _warmup_video_decoder(driver, str(first_clip))
 
         success = 0
         fail = 0
