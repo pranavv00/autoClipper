@@ -441,14 +441,40 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
         _log("⏳ Waiting for video to process...", indent=1)
         human_delay(5.0, 2.0)
 
-        # Check for browser video decoding/reading error modal
+        # Check for browser video decoding/reading error modal with automatic retry
+        for attempt in range(2):
+            try:
+                error_modal = driver.find_element(By.XPATH,
+                    "//*[contains(text(), \"Video couldn't be uploaded\") or "
+                    "contains(text(), 'could not be read by your browser')]"
+                )
+                if error_modal.is_displayed():
+                    _log("⚠ Instagram error: 'Video could not be read by browser' — attempting in-place retry...", indent=1)
+                    try:
+                        select_btn = driver.find_element(By.XPATH, "//button[contains(., 'Select other files') or text()='Select other files']")
+                        select_btn.click()
+                    except Exception:
+                        pass
+                    human_delay(2.0)
+                    file_input = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
+                    )
+                    file_input.send_keys(video_path)
+                    _log("✓ Video file re-sent, waiting for decoding...", indent=1)
+                    human_delay(6.0, 2.0)
+                else:
+                    break
+            except NoSuchElementException:
+                break
+
+        # Final check if error modal is still stubbornly present
         try:
             error_modal = driver.find_element(By.XPATH,
                 "//*[contains(text(), \"Video couldn't be uploaded\") or "
                 "contains(text(), 'could not be read by your browser')]"
             )
             if error_modal.is_displayed():
-                _log("✖  Instagram error modal: Video could not be read by browser", indent=1)
+                _log("✖  Instagram error modal persisted after retry", indent=1)
                 driver.save_screenshot("/tmp/ig_debug_read_error.png")
                 return False
         except NoSuchElementException:
