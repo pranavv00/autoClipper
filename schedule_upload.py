@@ -523,33 +523,48 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
         file_input.send_keys(video_path)
         _log("✓ Video file selected", indent=1)
 
-        # Wait for video to process
+        # Wait for video to process — poll for Next button or error (up to 60s)
         _log("⏳ Waiting for video to process...", indent=1)
-        human_delay(5.0, 2.0)
+        video_ready = False
+        for _wait in range(12):  # 12 × 5s = 60s max
+            human_delay(4.0, 2.0)
 
-        # Check for browser video decoding/reading error modal
-        try:
-            error_modal = driver.find_element(By.XPATH,
-                "//*[contains(text(), \"Video couldn't be uploaded\") or "
-                "contains(text(), 'could not be read by your browser')]"
-            )
-            if error_modal.is_displayed():
-                _log("✖  Instagram error: Video could not be read by browser", indent=1)
-                driver.save_screenshot("/tmp/ig_debug_read_error.png")
-                return False
-        except NoSuchElementException:
-            pass
+            # Check for browser video decoding/reading error modal
+            try:
+                error_modal = driver.find_element(By.XPATH,
+                    "//*[contains(text(), \"Video couldn't be uploaded\") or "
+                    "contains(text(), 'could not be read by your browser')]"
+                )
+                if error_modal.is_displayed():
+                    _log("✖  Instagram error: Video could not be read by browser", indent=1)
+                    driver.save_screenshot("/tmp/ig_debug_read_error.png")
+                    return False
+            except NoSuchElementException:
+                pass
 
-        # Dismiss any ratio / reel alert popup
-        try:
-            ok_btn = driver.find_element(By.XPATH,
-                "//button[text()='OK' or .//div[text()='OK']] | "
-                "//div[@role='button' and text()='OK']"
-            )
-            ok_btn.click()
-            human_delay(1.0)
-        except NoSuchElementException:
-            pass
+            # Dismiss any ratio / reel alert popup
+            try:
+                ok_btn = driver.find_element(By.XPATH,
+                    "//button[text()='OK' or .//div[text()='OK']] | "
+                    "//div[@role='button' and text()='OK']"
+                )
+                ok_btn.click()
+                human_delay(1.0)
+            except NoSuchElementException:
+                pass
+
+            # Check if Next button is available (video finished processing)
+            try:
+                driver.find_element(By.XPATH,
+                    "//*[@role='button' and normalize-space()='Next'] | "
+                    "//button[normalize-space()='Next'] | "
+                    "//*[normalize-space(text())='Next' and (@role='button' or ancestor::*[@role='button'])]"
+                )
+                video_ready = True
+                _log(f"✓ Video processed (took ~{(_wait+1)*5}s)", indent=1)
+                break
+            except NoSuchElementException:
+                pass
 
         # ── Step 4: Click Next → Next ───────────────────────────────────
         # Next #1: past crop screen
