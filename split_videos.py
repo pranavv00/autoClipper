@@ -168,11 +168,34 @@ def build_filtergraph(
     return ",".join(filters)
 
 
+def verify_clip_integrity(clip_path: Path) -> bool:
+    """Decode a sample of frames from the clip to verify the video is actually playable.
+    This catches corrupt NAL units and broken streams that metadata-only checks miss."""
+    try:
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", str(clip_path),
+            "-vframes", "30",       # decode first 30 frames (~1s)
+            "-f", "null", "-",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        # Any errors in stderr means corruption
+        if res.returncode != 0:
+            return False
+        error_text = res.stderr.strip().lower()
+        if "invalid" in error_text or "error" in error_text or "corrupt" in error_text:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def is_valid_clip(clip_path: Path) -> bool:
-    """Check if clip exists, is healthy, has standard SAR 1:1, and High/Main profile."""
+    """Check if clip exists, has correct metadata, AND can actually be decoded."""
     if not clip_path.exists() or clip_path.stat().st_size < 50000:
         return False
     try:
+        # 1. Metadata check (SAR + profile)
         cmd = [
             "ffprobe", "-v", "quiet",
             "-select_streams", "v:0",
@@ -193,7 +216,11 @@ def is_valid_clip(clip_path: Path) -> bool:
             elif line.startswith("profile="):
                 prof = line.split("=", 1)[1].strip().lower()
                 profile_ok = ("high" in prof or "main" in prof)
-        return sar_ok and profile_ok
+        if not (sar_ok and profile_ok):
+            return False
+
+        # 2. Integrity check — actually decode frames to catch corrupt NAL units
+        return verify_clip_integrity(clip_path)
     except Exception:
         return False
 
@@ -244,8 +271,15 @@ def encode_single_clip(
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if res.returncode == 0 and clip_path.exists() and clip_path.stat().st_size > 50000:
-            print(f"\r  [{part_num}/{expected_clips}] {clip_name} ✓", end="", flush=True)
-            return True
+            # Post-encode integrity check — verify the clip is actually decodable
+            if verify_clip_integrity(clip_path):
+                print(f"\r  [{part_num}/{expected_clips}] {clip_name} ✓", end="", flush=True)
+                return True
+            else:
+                print()
+                _log(f"⚠ {clip_name} produced but CORRUPT — deleting for re-encode", indent=1)
+                clip_path.unlink(missing_ok=True)
+                return False
         else:
             print()
             _log(f"⚠ Failed to create {clip_name}", indent=1)
@@ -283,7 +317,7 @@ def process_video(
     start_time = time.monotonic()
 
     # Process clips in parallel using 4 worker threads
-    max_workers = min(4, expected_clips)
+    max_workers = min(2, expected_clips)
     _log(f"Encoding : Running with {max_workers} parallel workers...", indent=1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

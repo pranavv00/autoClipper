@@ -469,6 +469,20 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
     video_path: str = str(clip["path"].resolve())
     scheduled_time: datetime = clip["scheduled_time"]
 
+    # Pre-upload integrity check — verify video is decodable before wasting time
+    try:
+        import subprocess as _sp
+        _check = _sp.run(
+            ["ffmpeg", "-v", "error", "-i", video_path, "-vframes", "10", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=10,
+        )
+        err = _check.stderr.strip().lower()
+        if _check.returncode != 0 or "invalid" in err or "error" in err:
+            _log(f"✖  SKIPPING {clip['clip_name']} — video file is corrupt (failed decode check)", indent=1)
+            return False
+    except Exception:
+        pass  # If ffmpeg isn't available, skip the check
+
     try:
         # Ensure driver is attached to the active browser window
         try:
@@ -517,10 +531,76 @@ def upload_and_schedule_reel(driver, clip: dict) -> bool:
         # ── Step 3: Upload the video file ───────────────────────────────
         _log(f"Uploading: {clip['clip_name']}...", indent=1)
 
-        file_input = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
-        )
-        file_input.send_keys(video_path)
+        def _try_upload_file(drv, vpath):
+            """Find the file input, make it visible, and send_keys. Returns True if
+            the dialog transitions past the 'Drag photos' landing screen."""
+            fi = WebDriverWait(drv, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
+            )
+            # Ensure input is interactable (Instagram sometimes hides it)
+            drv.execute_script("""
+                let inp = arguments[0];
+                inp.style.display = 'block';
+                inp.style.opacity = '1';
+                inp.style.position = 'fixed';
+                inp.style.top = '0';
+                inp.style.left = '0';
+                inp.style.width = '200px';
+                inp.style.height = '200px';
+                inp.style.zIndex = '99999';
+            """, fi)
+            time.sleep(0.5)
+            fi.send_keys(vpath)
+            # Wait up to 10s for the dialog to transition past the upload landing
+            for _ in range(5):
+                time.sleep(2)
+                still_on_landing = drv.execute_script("""
+                    return !!Array.from(document.querySelectorAll('*')).find(
+                        e => e.innerText && e.innerText.trim() === 'Drag photos and videos here'
+                    );
+                """)
+                if not still_on_landing:
+                    return True
+            return False
+
+        uploaded_ok = _try_upload_file(driver, video_path)
+        if not uploaded_ok:
+            _log("⚠  File input didn't register — retrying...", indent=1)
+            # Close dialog and re-open
+            try:
+                driver.find_element(By.XPATH, "//*[@aria-label='Close' or @aria-label='Discard']").click()
+                human_delay(1.0)
+            except Exception:
+                driver.get("https://www.instagram.com/")
+                human_delay(3.0)
+            # Re-open Create dialog
+            _dismiss_popups(driver)
+            create_btn2 = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH,
+                    "//*[contains(@aria-label, 'New post') or contains(@aria-label, 'Create')] | "
+                    "//a[.//span[text()='Create']] | "
+                    "//div[@role='button'][.//span[text()='Create']]"
+                ))
+            )
+            create_btn2.click()
+            human_delay(1.5)
+            try:
+                post_item2 = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH,
+                        "//a[.//span[text()='Post'] or text()='Post'] | "
+                        "//div[@role='button'][.//span[text()='Post'] or text()='Post'] | "
+                        "//span[text()='Post']"
+                    ))
+                )
+                post_item2.click()
+                human_delay(1.5)
+            except TimeoutException:
+                pass
+            uploaded_ok = _try_upload_file(driver, video_path)
+            if not uploaded_ok:
+                _log("✖  File upload failed after retry", indent=1)
+                return False
+
         _log("✓ Video file selected", indent=1)
 
         # Wait for video to process — poll for Next button or error (up to 60s)
