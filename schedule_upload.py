@@ -85,6 +85,11 @@ BROWSER_TIMEOUT: int = 60
 # Delay between browser actions (seconds) — human-like
 ACTION_DELAY: float = 2.0
 
+# Quiet hours — no reels scheduled between these times (24h format)
+# Posts that would land in this window get pushed to QUIET_END
+QUIET_START: int = 0   # midnight (12 AM)
+QUIET_END: int = 9     # 9 AM
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +115,17 @@ def human_delay(base: float = ACTION_DELAY, variance: float = 1.0) -> None:
     """Sleep for a human-like random duration."""
     import random
     time.sleep(base + random.uniform(0, variance))
+
+
+def skip_quiet_hours(dt: datetime) -> datetime:
+    """
+    If *dt* falls inside the quiet window (QUIET_START .. QUIET_END),
+    push it forward to QUIET_END on the same day.
+    """
+    hour = dt.hour
+    if QUIET_START <= hour < QUIET_END:
+        return dt.replace(hour=QUIET_END, minute=0, second=0, microsecond=0)
+    return dt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -352,29 +368,70 @@ def ensure_instagram_logged_in(driver) -> bool:
 def _warmup_video_decoder(driver, video_path: str) -> None:
     """
     Force Chrome to initialise its GPU video decoder (Apple VideoToolbox on macOS)
-    by loading a video file directly. On cold launch the decoder isn't ready and
-    Instagram's JS-based video preview fails with 'could not be read by your browser'.
-    Loading any video via file:// URL primes the decoder for all subsequent uses.
+    by loading and *playing* a video file directly.  On cold launch the decoder
+    isn't ready and Instagram's JS-based video preview fails with
+    'could not be read by your browser'.
+
+    Strategy:
+    1. Load the video via file:// URL
+    2. Force-play it and wait for readyState >= 3 (HAVE_FUTURE_DATA)
+    3. Retry up to 3 times if the decoder hasn't initialised
+    4. Keep the video playing for a few seconds to fully prime VideoToolbox
     """
     _log("🔥 Warming up Chrome video decoder...")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            driver.get(f"file://{video_path}")
+            time.sleep(2)
+
+            # Force autoplay + load
+            driver.execute_script("""
+                let v = document.querySelector('video');
+                if (v) {
+                    v.muted = true;
+                    v.play().catch(() => {});
+                }
+            """)
+            time.sleep(4)
+
+            result = driver.execute_script("""
+                let v = document.querySelector('video');
+                if (!v) return {ok: false, reason: 'no video element'};
+                return {
+                    ok: v.readyState >= 3,
+                    readyState: v.readyState,
+                    width: v.videoWidth,
+                    height: v.videoHeight,
+                    currentTime: v.currentTime,
+                    error: v.error ? v.error.message : null
+                };
+            """)
+
+            if result and result.get("ok"):
+                _log(f"✓ Video decoder ready on attempt {attempt} "
+                     f"({result.get('width')}x{result.get('height')}, "
+                     f"played {result.get('currentTime', 0):.1f}s)")
+                # Let it play a bit more to fully prime the decoder pipeline
+                time.sleep(3)
+                break
+            else:
+                _log(f"⚠ Attempt {attempt}/{max_attempts} — decoder not ready: {result}")
+                if attempt < max_attempts:
+                    time.sleep(3)
+        except Exception as exc:
+            _log(f"⚠ Attempt {attempt}/{max_attempts} warmup error: {exc}")
+            if attempt < max_attempts:
+                time.sleep(2)
+    else:
+        _log("⚠ Decoder warmup did not fully succeed after all attempts (continuing anyway)")
+
+    # Navigate away so we start clean
     try:
-        driver.get(f"file://{video_path}")
-        time.sleep(3)
-        # Verify the video actually decoded
-        result = driver.execute_script("""
-            let v = document.querySelector('video');
-            if (!v) return {ok: false, reason: 'no video element'};
-            return {ok: v.readyState >= 2, width: v.videoWidth, height: v.videoHeight};
-        """)
-        if result and result.get("ok"):
-            _log(f"✓ Video decoder ready ({result.get('width')}x{result.get('height')})")
-        else:
-            _log(f"⚠ Decoder warmup inconclusive: {result}")
-        # Navigate away so we start clean
         driver.get("about:blank")
-        time.sleep(0.5)
-    except Exception as exc:
-        _log(f"⚠ Decoder warmup error (non-fatal): {exc}")
+        time.sleep(1)
+    except Exception:
+        pass
 
 
 
@@ -905,8 +962,15 @@ def main() -> None:
         first_publish = min_allowed_time.replace(second=0, microsecond=0)
         _log(f"⏰ Starting at {args.delay}m from now: {first_publish.strftime('%b %d, %I:%M %p')}")
 
+    # Apply quiet-hours skip to the first publish time itself
+    first_publish = skip_quiet_hours(first_publish)
+
     for i, clip in enumerate(pending):
-        clip["scheduled_time"] = first_publish + timedelta(seconds=i * interval_seconds)
+        if i == 0:
+            candidate = first_publish
+        else:
+            candidate = pending[i - 1]["scheduled_time"] + timedelta(seconds=interval_seconds)
+        clip["scheduled_time"] = skip_quiet_hours(candidate)
         clip["caption"] = args.caption.format(
             title=clip["title"].replace("_", " ").replace("-", " ").title(),
             part=clip["part"],
